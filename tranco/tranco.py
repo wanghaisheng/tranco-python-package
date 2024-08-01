@@ -239,7 +239,26 @@ class Tranco:
                 raise ValueError("Rate limit exceeded. Please try again later.")
             else:
                 response.raise_for_status()
-    
+
+    async def list_metadata(self, list_id: str) -> Dict[str, Any]:
+        """
+        Retrieve metadata for list (whether it is already available, what its configuration is, ...)
+        :param list_id: ID of the list for which to query metadata
+        :return: dictionary with the information listed at https://tranco-list.eu/api_documentation
+        """
+        url = f'https://tranco-list.eu/lists/id/{list_id}'
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status == 404:
+                    raise ValueError("There is no list with the given ID.")
+                else:
+                    response_text = await response.text()
+                    raise ValueError(f"An error occurred: {response_text}")
+        except aiohttp.ClientError as e:
+            raise ValueError(f"An error occurred while requesting metadata: {e}")
+
     async def close(self) -> None:
-        """Close the aiohttp session."""
+        """Close the aiohttp client session."""
         await self.session.close()
