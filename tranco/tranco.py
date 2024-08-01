@@ -1,13 +1,13 @@
 import json
-from datetime import datetime, timedelta
-from io import BytesIO
-from itertools import islice
-from typing import Dict, List, Optional, Tuple, Any
-
-import requests
 import os
 import platform
 import zipfile
+from datetime import datetime, timedelta
+from io import BytesIO
+from itertools import islice
+from typing import Dict, List, Optional, Tuple, Any, Union
+
+import httpx
 from warnings import warn
 from enum import IntEnum
 
@@ -41,9 +41,10 @@ class Tranco:
             cache_dir: <str> directory used to cache Tranco top lists, default: cwd + .tranco/
             account_email: <str> Account email address: retrieve from https://tranco-list.eu/account
             api_key: <str> API key: retrieve from https://tranco-list.eu/account
+            http_proxy: <str> HTTP proxy URL (e.g., http://localhost:8080)
+            socks5_proxy: <str> SOCKS5 proxy URL (e.g., socks5://localhost:1080)
         """
 
-        # Caching is required.
         self.cache_dir: Optional[str] = kwargs.get('cache_dir', None)
         if self.cache_dir is None:
             cwd = os.getcwd()
@@ -56,15 +57,27 @@ class Tranco:
         self.account_email: str = kwargs.get('account_email')
         self.api_key: str = kwargs.get('api_key')
 
-        self.session: requests.Session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Python/{} python-requests/{} tranco-python/{}'.format(
-            platform.python_version(), requests.__version__, VERSION)})
+        # Proxy settings
+        self.http_proxy: Optional[str] = kwargs.get('http_proxy')
+        self.socks5_proxy: Optional[str] = kwargs.get('socks5_proxy')
+
+        proxy_urls = {}
+        if self.http_proxy:
+            proxy_urls['http'] = self.http_proxy
+            proxy_urls['https'] = self.http_proxy
+        if self.socks5_proxy:
+            proxy_urls['socks5'] = self.socks5_proxy
+
+        self.client: httpx.AsyncClient = httpx.AsyncClient(
+            headers={'User-Agent': f'Python/{platform.python_version()} httpx/{httpx.__version__} tranco-python/{VERSION}'},
+            proxies=proxy_urls
+        )
 
     def _cache_metadata_path(self) -> str:
         return os.path.join(self.cache_dir, 'metadata.json')
 
     def _cache_path(self, list_id) -> str:
-        return os.path.join(self.cache_dir, '{}.csv'.format(list_id))
+        return os.path.join(self.cache_dir, f'{list_id}.csv')
 
     def _load_cache_metadata(self) -> None:
         if not os.path.exists(self._cache_metadata_path()):
@@ -102,8 +115,8 @@ class Tranco:
             os.remove(os.path.join(self.cache_dir, f))
         self._load_cache_metadata()
 
-    def list(self, date: Optional[str] = None, list_id: Optional[str] = None, subdomains: bool = False,
-             full: bool = False) -> TrancoList:
+    async def list(self, date: Optional[str] = None, list_id: Optional[str] = None, subdomains: bool = False,
+                   full: bool = False) -> TrancoList:
         """
         Retrieve a Tranco top list.
         :param date: Get the daily list for this date. If not given, the latest list is returned.
@@ -122,10 +135,10 @@ class Tranco:
             if (not date) or (date == 'latest'):  # no arguments given: default to latest list
                 yesterday = (datetime.utcnow() - timedelta(days=1))
                 date = yesterday.strftime('%Y-%m-%d')
-            list_id = self._get_list_id_for_date(date, subdomains=subdomains)
+            list_id = await self._get_list_id_for_date(date, subdomains=subdomains)
 
         if not self._is_cached(list_id, full):
-            self._download_file(list_id, full)  # download list and load into cache
+            await self._download_file(list_id, full)  # download list and load into cache
         with open(self._cache_path(list_id)) as f:  # read list from cache
             if full:
                 top_list_lines = f.read().splitlines()
@@ -134,24 +147,25 @@ class Tranco:
 
         return TrancoList(date, list_id, list(map(lambda x: x[x.index(',') + 1:], top_list_lines)))
 
-    def _get_list_id_for_date(self, date: str, subdomains: bool = False) -> str:
-        r1 = self.session.get(
-            'https://tranco-list.eu/daily_list_id?date={}&subdomains={}'.format(date, str(subdomains).lower()))
+    async def _get_list_id_for_date(self, date: str, subdomains: bool = False) -> str:
+        r1 = await self.client.get(
+            f'https://tranco-list.eu/daily_list_id?date={date}&subdomains={str(subdomains).lower()}'
+        )
         if r1.status_code == 200:
             return r1.text
         else:
             raise AttributeError("The daily list for this date is currently unavailable.")
 
-    def _download_file(self, list_id: str, full: bool = False) -> None:
+    async def _download_file(self, list_id: str, full: bool = False) -> None:
         if full:
-            self._download_full_file(list_id)
+            await self._download_full_file(list_id)
         else:
-            self._download_zip_file(list_id)
+            await self._download_zip_file(list_id)
         self._add_to_cache(list_id, full)
 
-    def _download_zip_file(self, list_id: str) -> None:
-        download_url = 'https://tranco-list.eu/download_daily/{}'.format(list_id)
-        r = self.session.get(download_url, stream=True)
+    async def _download_zip_file(self, list_id: str) -> None:
+        download_url = f'https://tranco-list.eu/download_daily/{list_id}'
+        r = await self.client.get(download_url, stream=True)
         if r.status_code == 200:
             with zipfile.ZipFile(BytesIO(r.content)) as z:
                 with z.open('top-1m.csv') as csvf:
@@ -160,8 +174,8 @@ class Tranco:
                         f.write(file_bytes)
         elif r.status_code == 403:
             # List not available as ZIP file
-            download_url = 'https://tranco-list.eu/download/{}/1000000'.format(list_id)
-            r2 = self.session.get(download_url)
+            download_url = f'https://tranco-list.eu/download/{list_id}/1000000'
+            r2 = await self.client.get(download_url)
             if r2.status_code == 200:
                 file_bytes = r2.content
                 with open(self._cache_path(list_id), 'wb') as f:
@@ -175,59 +189,54 @@ class Tranco:
             # List unavailable (non-success status code)
             raise AttributeError("The daily list for this date is currently unavailable.")
 
-    def _download_full_file(self, list_id: str) -> None:
-        download_url = 'https://tranco-list.eu/download/{}/full'.format(list_id)
-        r = self.session.get(download_url)
+    async def _download_full_file(self, list_id: str) -> None:
+        download_url = f'https://tranco-list.eu/download/{list_id}/full'
+        r = await self.client.get(download_url)
         if r.status_code == 200:
             file_bytes = r.content
             with open(self._cache_path(list_id), 'wb') as f:
                 f.write(file_bytes)
 
-    def configure(self, configuration: Dict[str, Any]) -> Tuple[bool, str]:
+    async def configure(self, configuration: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Configure a custom list (https://tranco-list.eu/configure).
         Requires that valid credentials were passed when creating the `Tranco` object.
         :param configuration: dictionary that conforms to the schema at
-                              https://tranco-list.eu/api_documentation#datatypes-configuration
-        :return Tuple[bool, str]: whether the list is already available; the ID (to be) assigned to this list.
-        Use `list_metadata` with this ID to (continuously) check whether the list has finished generating
-         and is now available.
-        :raise ValueError if list generation failed
+        https://tranco-list.eu/api/configure
+        :return: tuple (success: bool, message: str)
         """
-
         if not self.account_email or not self.api_key:
-            raise ValueError("You have not supplied valid credentials.")
-
-        if not isinstance(configuration, dict):
-            raise ValueError("You supplied an invalid configuration.")
-
-        r = self.session.put(
-            "https://tranco-list.eu/api/lists/create",
-            auth=(self.account_email, self.api_key),
-            json=configuration
+            raise ValueError("You need to provide `account_email` and `api_key` to configure a custom list.")
+        
+        response = await self.client.post(
+            'https://tranco-list.eu/configure',
+            json=configuration,
+            headers={
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
+            }
         )
-
-        if r.status_code == 200 or r.status_code == 202:
-            # 200: list already exists (available=True); 202: list is being generated (available=False)
-            response = r.json()
-            return response["available"], response["list_id"]
-        elif r.status_code == 400:
-            raise ValueError("You supplied an invalid configuration.")
-        elif r.status_code == 401:
-            raise ValueError("You supplied invalid credentials.")
-        elif r.status_code == 429:
-            raise ValueError("You are already generating a list.")
-        elif r.status_code == 403 or r.status_code == 502 or r.status_code == 503:
-            raise ValueError("This service is temporarily unavailable.")
-
-    def list_metadata(self, list_id: str) -> Dict[str, Any]:
-        """
-        Retrieve metadata for list (whether it is already available, what its configuration is, ...)
-        :param list_id: ID of the list for which to query metadata
-        :return: dictionary with the information listed at https://tranco-list.eu/api_documentation
-        """
-        r = self.session.get("https://tranco-list.eu/api/lists/id/{list_id}".format(list_id=list_id))
-        if r.status_code == 404:
-            raise ValueError("There is no list with the given ID.")
+        
+        if response.status_code == 200:
+            result = response.json()
+            return (True, result.get('message', 'Configuration successful'))
         else:
-            return r.json()
+            return (False, response.text)
+
+    async def get_domain_ranks(self, domain: str) -> Dict[str, Any]:
+        """
+        Retrieve the ranks of a domain in the daily lists of the past 30 days.
+        :param domain: The domain for which to query ranks.
+        :return: Dictionary containing ranks information.
+        :raises ValueError: If the domain is not valid or the request fails.
+        """
+        response = await self.client.get(f'https://tranco-list.eu/ranks/domain/{domain}')
+        
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 403:
+            raise ValueError("Service temporarily unavailable.")
+        elif response.status_code == 429:
+            raise ValueError("Rate limit exceeded. Please try again later.")
+        else:
+            response.raise_for_status()
