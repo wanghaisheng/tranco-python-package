@@ -196,6 +196,24 @@ class Tranco:
             file_bytes = r.content
             with open(self._cache_path(list_id), 'wb') as f:
                 f.write(file_bytes)
+    async def list_metadata(self, list_id: str) -> Dict[str, Any]:
+        """
+        Retrieve metadata for list (whether it is already available, what its configuration is, ...)
+        :param list_id: ID of the list for which to query metadata
+        :return: dictionary with the information listed at https://tranco-list.eu/api_documentation
+        """
+        url = f'https://tranco-list.eu/lists/id/{list_id}'
+        try:
+            response = await self.httpx_client.get(url)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise ValueError("There is no list with the given ID.")
+            else:
+                raise ValueError("An error occurred while fetching the metadata.")
+        except httpx.RequestError as e:
+            raise ValueError(f"An error occurred while requesting metadata: {e}")
 
     async def configure(self, configuration: Dict[str, Any]) -> Tuple[bool, str]:
         """
