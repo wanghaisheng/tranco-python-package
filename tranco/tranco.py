@@ -1,13 +1,13 @@
 import json
+import os
+import platform
+import zipfile
 from datetime import datetime, timedelta
 from io import BytesIO
 from itertools import islice
 from typing import Dict, List, Optional, Tuple, Any
 
 import requests
-import os
-import platform
-import zipfile
 from warnings import warn
 from enum import IntEnum
 
@@ -41,9 +41,10 @@ class Tranco:
             cache_dir: <str> directory used to cache Tranco top lists, default: cwd + .tranco/
             account_email: <str> Account email address: retrieve from https://tranco-list.eu/account
             api_key: <str> API key: retrieve from https://tranco-list.eu/account
+            http_proxy: <str> HTTP proxy URL (e.g., http://localhost:8080)
+            socks5_proxy: <str> SOCKS5 proxy URL (e.g., socks5://localhost:1080)
         """
 
-        # Caching is required.
         self.cache_dir: Optional[str] = kwargs.get('cache_dir', None)
         if self.cache_dir is None:
             cwd = os.getcwd()
@@ -56,15 +57,33 @@ class Tranco:
         self.account_email: str = kwargs.get('account_email')
         self.api_key: str = kwargs.get('api_key')
 
-        self.session: requests.Session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Python/{} python-requests/{} tranco-python/{}'.format(
-            platform.python_version(), requests.__version__, VERSION)})
+        # Proxy settings
+        self.http_proxy: Optional[str] = kwargs.get('http_proxy')
+        self.socks5_proxy: Optional[str] = kwargs.get('socks5_proxy')
+
+        # Proxy configuration for requests
+        self.proxies = None
+        if self.socks5_proxy:
+            self.proxies = {
+                'http': f'socks5://{self.socks5_proxy}',
+                'https': f'socks5://{self.socks5_proxy}',
+            }
+        elif self.http_proxy:
+            self.proxies = {
+                'http': f'http://{self.http_proxy}',
+                'https': f'http://{self.http_proxy}',
+            }
+
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': f'Python/{platform.python_version()} requests/{requests.__version__} tranco-python/{VERSION}'})
+        if self.proxies:
+            self.session.proxies.update(self.proxies)
 
     def _cache_metadata_path(self) -> str:
         return os.path.join(self.cache_dir, 'metadata.json')
 
     def _cache_path(self, list_id) -> str:
-        return os.path.join(self.cache_dir, '{}.csv'.format(list_id))
+        return os.path.join(self.cache_dir, f'{list_id}.csv')
 
     def _load_cache_metadata(self) -> None:
         if not os.path.exists(self._cache_metadata_path()):
@@ -135,10 +154,12 @@ class Tranco:
         return TrancoList(date, list_id, list(map(lambda x: x[x.index(',') + 1:], top_list_lines)))
 
     def _get_list_id_for_date(self, date: str, subdomains: bool = False) -> str:
-        r1 = self.session.get(
-            'https://tranco-list.eu/daily_list_id?date={}&subdomains={}'.format(date, str(subdomains).lower()))
-        if r1.status_code == 200:
-            return r1.text
+        response = self.session.get(
+            f'https://tranco-list.eu/daily_list_id?date={date}&subdomains={str(subdomains).lower()}',
+            proxies=self.proxies
+        )
+        if response.status_code == 200:
+            return response.text
         else:
             raise AttributeError("The daily list for this date is currently unavailable.")
 
@@ -150,25 +171,25 @@ class Tranco:
         self._add_to_cache(list_id, full)
 
     def _download_zip_file(self, list_id: str) -> None:
-        download_url = 'https://tranco-list.eu/download_daily/{}'.format(list_id)
-        r = self.session.get(download_url, stream=True)
-        if r.status_code == 200:
-            with zipfile.ZipFile(BytesIO(r.content)) as z:
+        download_url = f'https://tranco-list.eu/download_daily/{list_id}'
+        response = self.session.get(download_url, proxies=self.proxies, stream=True)
+        if response.status_code == 200:
+            with zipfile.ZipFile(BytesIO(response.content)) as z:
                 with z.open('top-1m.csv') as csvf:
                     file_bytes = csvf.read()
                     with open(self._cache_path(list_id), 'wb') as f:
                         f.write(file_bytes)
-        elif r.status_code == 403:
+        elif response.status_code == 403:
             # List not available as ZIP file
-            download_url = 'https://tranco-list.eu/download/{}/1000000'.format(list_id)
-            r2 = self.session.get(download_url)
-            if r2.status_code == 200:
-                file_bytes = r2.content
+            download_url = f'https://tranco-list.eu/download/{list_id}/1000000'
+            response2 = self.session.get(download_url, proxies=self.proxies)
+            if response2.status_code == 200:
+                file_bytes = response2.content
                 with open(self._cache_path(list_id), 'wb') as f:
                     f.write(file_bytes)
             else:
                 raise AttributeError("The daily list for this date is currently unavailable.")
-        elif r.status_code == 502:
+        elif response.status_code == 502:
             # List unavailable (bad gateway)
             raise AttributeError("This list is currently unavailable.")
         else:
@@ -176,10 +197,10 @@ class Tranco:
             raise AttributeError("The daily list for this date is currently unavailable.")
 
     def _download_full_file(self, list_id: str) -> None:
-        download_url = 'https://tranco-list.eu/download/{}/full'.format(list_id)
-        r = self.session.get(download_url)
-        if r.status_code == 200:
-            file_bytes = r.content
+        download_url = f'https://tranco-list.eu/download/{list_id}/full'
+        response = self.session.get(download_url, proxies=self.proxies)
+        if response.status_code == 200:
+            file_bytes = response.content
             with open(self._cache_path(list_id), 'wb') as f:
                 f.write(file_bytes)
 
@@ -188,37 +209,26 @@ class Tranco:
         Configure a custom list (https://tranco-list.eu/configure).
         Requires that valid credentials were passed when creating the `Tranco` object.
         :param configuration: dictionary that conforms to the schema at
-                              https://tranco-list.eu/api_documentation#datatypes-configuration
-        :return Tuple[bool, str]: whether the list is already available; the ID (to be) assigned to this list.
-        Use `list_metadata` with this ID to (continuously) check whether the list has finished generating
-         and is now available.
-        :raise ValueError if list generation failed
+        https://tranco-list.eu/api/configure
+        :return: tuple (success: bool, message: str)
         """
-
         if not self.account_email or not self.api_key:
-            raise ValueError("You have not supplied valid credentials.")
+            raise ValueError("You need to provide `account_email` and `api_key` to configure a custom list.")
 
-        if not isinstance(configuration, dict):
-            raise ValueError("You supplied an invalid configuration.")
-
-        r = self.session.put(
-            "https://tranco-list.eu/api/lists/create",
-            auth=(self.account_email, self.api_key),
-            json=configuration
+        response = self.session.post(
+            'https://tranco-list.eu/configure',
+            json=configuration,
+            headers={
+                'Authorization': f'Bearer {self.api_key}',
+                'Content-Type': 'application/json'
+            },
+            proxies=self.proxies
         )
-
-        if r.status_code == 200 or r.status_code == 202:
-            # 200: list already exists (available=True); 202: list is being generated (available=False)
-            response = r.json()
-            return response["available"], response["list_id"]
-        elif r.status_code == 400:
-            raise ValueError("You supplied an invalid configuration.")
-        elif r.status_code == 401:
-            raise ValueError("You supplied invalid credentials.")
-        elif r.status_code == 429:
-            raise ValueError("You are already generating a list.")
-        elif r.status_code == 403 or r.status_code == 502 or r.status_code == 503:
-            raise ValueError("This service is temporarily unavailable.")
+        if response.status_code == 200:
+            result = response.json()
+            return (True, result.get('message', 'Configuration successful'))
+        else:
+            return (False, response.text)
 
     def list_metadata(self, list_id: str) -> Dict[str, Any]:
         """
@@ -226,8 +236,31 @@ class Tranco:
         :param list_id: ID of the list for which to query metadata
         :return: dictionary with the information listed at https://tranco-list.eu/api_documentation
         """
-        r = self.session.get("https://tranco-list.eu/api/lists/id/{list_id}".format(list_id=list_id))
-        if r.status_code == 404:
+        response = self.session.get(f'https://tranco-list.eu/lists/id/{list_id}', proxies=self.proxies)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
             raise ValueError("There is no list with the given ID.")
         else:
-            return r.json()
+            response.raise_for_status()
+
+    def get_domain_ranks(self, domain: str) -> Dict[str, Any]:
+        """
+        Retrieve the ranks of a domain in the daily lists of the past 30 days.
+        :param domain: The domain for which to query ranks.
+        :return: Dictionary containing ranks information.
+        :raises ValueError: If the domain is not valid or the request fails.
+        """
+        response = self.session.get(f'https://tranco-list.eu/ranks/domain/{domain}', proxies=self.proxies)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 403:
+            raise ValueError("Service temporarily unavailable.")
+        elif response.status_code == 429:
+            raise ValueError("Rate limit exceeded. Please try again later.")
+        else:
+            response.raise_for_status()
+
+    def close(self) -> None:
+        """Close the requests session."""
+        self.session.close()
