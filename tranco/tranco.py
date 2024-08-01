@@ -258,3 +258,7 @@ class Tranco:
             raise ValueError("Rate limit exceeded. Please try again later.")
         else:
             response.raise_for_status()
+
+    async def close(self) -> None:
+        """Close the httpx client."""
+        await self.httpx_client.aclose()
